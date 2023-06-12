@@ -1,4 +1,4 @@
-# speechBox
+# SpeechBox
 
 speechBox is a powerful speech processing library that provides a comprehensive set of tools and algorithms for voice activity detection, speaker diarization, speech to text transcription, and speech enhancement.
 
