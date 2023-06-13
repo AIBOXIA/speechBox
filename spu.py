@@ -1,84 +1,163 @@
-
-import numpy as np
-from pydub import AudioSegment
-from vad import Vad
-import os
-from diarization import diarization
-import copy
-from libs.audio.features import Pretrained
-from libs.audio.utils.signal import Binarize
-import torchaudio
+import sys
 import yaml
+import os
+import torchaudio
+from pydub import AudioSegment
+from typing import List, Dict, Union
+from vad_test import vad
+import json
+from omegaconf import OmegaConf
+from nemo.collections.asr.models import ClusteringDiarizer
+import time
 
-class SpeechProcessingUnit():
 
-    def __init__(self):
-        self.fs = 16000
-        self.path = ""
-        self.args = ""
-
-    def initialize_config(self, threshold):
-
+class SpeechProcessingUnit:
+    def __init__(self, testdata_dir, num_speakers=5, gpu_number=1, threshold=0.5):
         path = os.path.dirname(os.path.realpath(__file__))
         self.path = path
-        print(path)
-        with open(f'{path}/finetuned_models/models/params.yml') as f:
-            args = yaml.load(f, Loader=yaml.FullLoader)
-            self.args = args
+        self.num_speakers = num_speakers
+        self.testdata_dir = testdata_dir
+        file_name_prepare, file_duration = self.prepare(testdata_dir)
+        self.file_name = file_name_prepare
+        # initialize segmentation pipeline
+        config_vad, config_dia = self.initialize_config(file_name_prepare, gpu_number, threshold)
+        self.cfg = config_vad
+        self.config_dia = config_dia
 
-        with open(f'{path}/finetuned_models/pipelines/dia_ami/config.yml') as s:
-            pipe = yaml.load(s, Loader=yaml.FullLoader)
+    def initialize_config(self, testdata_dir, gpu_number, threshold):
 
-        pipe['pipeline']['params']['sad_scores'] = os.path.join(path, "finetuned_models/models/sad/train/AMI.SpeakerDiarization.MixHeadset.train/weights/0499.pt")
-        pipe['pipeline']['params']['scd_scores'] = os.path.join(path, "finetuned_models/models/scd/train/AMI.SpeakerDiarization.MixHeadset.train/weights/0117.pt")
-        pipe['pipeline']['params']['embedding'] = os.path.join(path, "finetuned_models/models/emb/train/AMI.SpeakerDiarization.MixHeadset.train/weights/0135.pt")
+        with open(f"{self.path}/configs/vad_inference_postprocessing.yaml") as file:
+            config_vad = yaml.load(file, Loader=yaml.FullLoader)
 
+        audio_name = testdata_dir.split('/')[-1]
+        config_vad["out_manifest_filepath"] = audio_name.split('.')[0] + '.json'
+        config_vad["vad"]["model_path"] = f'{self.path}/models/epoch=200-step=5025.ckpt'
+        config_vad["dataset"] = f'{self.path}/configs/vad_test.json'
+        config_vad["vad"]["parameters"]["postprocessing"]["onset"] = float(threshold) + 0.1
+        config_vad["vad"]["parameters"]["postprocessing"]["offset"] = float(threshold) - 0.1
 
-        args["speech_turn_segmentation"]["speech_activity_detection"]["onset"] = float(threshold)
-        args["speech_turn_segmentation"]["speech_activity_detection"]["offset"] = float(threshold)
-        with open(f'{path}/finetuned_models/pipelines/dia_ami/config.yml', "w") as s:
-            yaml.dump(pipe, s)
+        with open(f'{self.path}/configs/vad_inference_postprocessing.yaml', 'w') as s:
+            yaml.dump(config_vad, s)
 
-        with open(f'{path}/finetuned_models/models/params.yml', "w") as f:
-            yaml.dump(args, f)
+        with open(config_vad["dataset"]) as json_file:
+            data_dir = json.load(json_file)
 
-    def vad(self, signal, fs, gpu_number):
-        """
-        
-        :param signal:  numpy array of signal data
-        :param fs: sample rate
-        :return: {"vad_out": vad output(numpy array), "fs": sample rate of vad(int)}
-        """
+        data_dir['audio_filepath'] = testdata_dir
 
-        # signal = signal.astype(np.float64)
-        if len(signal.shape) > 1:
-            signal = signal[:, 0]
+        with open(config_vad["dataset"], 'w') as json_file:
+            json.dump(data_dir, json_file)
 
-        # if fs != self.fs:
-        #     sound = AudioSegment(signal.tobytes(), frame_rate=fs, sample_width= min(4, signal.dtype.itemsize), channels=1)
-        #     sound.set_frame_rate(self.fs)
-        #     signal = np.frombuffer(sound._data, dtype=np.float16, offset=0)
+        with open(f"{self.path}/configs/diar_infer_telephonic.yaml") as file:
+            config_dia = yaml.load(file, Loader=yaml.FullLoader)
 
-        vad_unit = Vad(gpu_number)
-        vad_out, fs_vad = vad_unit.run(signal, fs)
+        config_dia["diarizer"]["speaker_embeddings"]["model_path"] = f'{self.path}/models/titanet-l.nemo'
+        config_dia["diarizer"]["manifest_filepath"] = f'{self.path}/configs/input_manifest.json'
+        self.out_dir = f'{self.path}/speaker_diar_output'
+        config_dia["diarizer"]["out_dir"] = self.out_dir
+        config_dia["diarizer"]["vad"]["external_vad_manifest"] = f'{self.file_name.split(".")[0]}.json'
+        config_dia["diarizer"]["vad"]["model_path"] = None
+        config_dia["device"] = f"cuda:{gpu_number}"
+        config_dia["diarizer"]["vad"]["parameters"]["onset"] = float(threshold) + 0.1
+        config_dia["diarizer"]["vad"]["parameters"]["offset"] = float(threshold) - 0.1
 
-        result = {}
-        result["vad_out"] = vad_out.tolist()
-        result['fs'] = fs_vad
-        # vad_json = json.dumps
+        with open(f'{self.path}/configs/diar_infer_telephonic.yaml', 'w') as s:
+            yaml.dump(config_dia, s)
 
-        return result
-    def prepare_audio(self,file_dir):
+        return config_vad, config_dia
+
+    def __call__(self, task: str) -> Union[Dict, List, None, str]:
+
+        if task == "vad":
+            out_manifest_filepath = self.vad_task(self.cfg)
+            self.out_manifest_filepath = out_manifest_filepath
+            vad_out = []
+            with open(f"{self.path}/{self.file_name}.json") as file:
+                lines = file.readlines()
+                for line in lines:
+                    line = line.split(" ")
+                    start = float(line[3][:len(line[3]) - 1])
+                    end = start + float(line[5][:len(line[5]) - 1])
+                    dia_dict = {"begin": start, "end": end}
+                    vad_out.append(dia_dict)
+
+            with open(f"{self.path}/{self.file_name}_vad_dict.json", 'w') as fp:
+                json.dump(vad_out, fp, indent=4)
+                fp.write('\n')
+
+            return out_manifest_filepath
+        elif task == "diarization":
+            self.diarization_task(self.file_name)
+            return dia_output
+
+        elif task == "vad_diarization":
+            self.vad_task(self.cfg)
+            self.diarization_task(self.file_name)
+            vad_out = []
+            with open(f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.json") as f:
+                lines = f.readlines()
+                for line in lines:
+                    line = line.split(" ")
+                    start = float(line[3][:len(line[3]) - 1])
+                    end = start + float(line[5][:len(line[5]) - 1])
+                    dia_dict = {"begin": start, "end": end}
+                    vad_out.append(dia_dict)
+
+            dia_out = []
+            num_speakers = self.num_speakers
+            with open(f"{self.out_dir}/pred_rttms/{self.file_name.split('/')[-1].split('.')[0]}.rttm") as f:
+                lines = f.readlines()
+                for line in lines:
+                    line = line.split(" ")
+                    start = float(line[5])
+                    end = start + float(line[8])
+                    speaker = int(line[11][8:])
+                    speakers = []
+                    for i in range(num_speakers):
+                        if i == speaker:
+                            temp = {"id": i, "prob": 100}
+                        else:
+                            temp = {"id": i, "prob": 0}
+                        speakers.append(temp)
+                    new_list = sorted(speakers, key=lambda d: d['prob'], reverse=True)
+                    dia_dict = {"begin": start, "end": end, "speakers": new_list}
+                    dia_out.append(dia_dict)
+
+            output = {
+                "sad_annotation": vad_out,
+                "dia_annotation": dia_out
+            }
+            output_dict_json = f"{self.path}/{self.testdata_dir.split('/')[-1].split('.')[0]}_out_dict.json"
+            with open(output_dict_json, 'w') as fp:
+                json.dump(output, fp, indent=4)
+                fp.write('\n')
+            del_file_json = f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.json"
+            del_file_wav = f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.wav"
+
+            os.remove(f'{del_file_json}')
+            os.remove(f'{del_file_wav}')
+
+            os.remove(f'{self.path}/manifest_vad_input.json')
+
+        else:
+            sys.exit("your task should be one of vad, diarization, vad_diarization")
+        return output_dict_json
+
+    def prepare(self, file_dir):
         if (file_dir.split(".")[-1]) == "mp3":
+            sound = AudioSegment.from_mp3(file_dir)
+            sound = sound.set_channels(1)
+            sound.export(file_dir, format="mp3")
             torchaudio.set_audio_backend("sox_io")
             fs = 16000
             signal, sample_rate = torchaudio.load(file_dir, format="mp3")
+
             file_duration = len(signal[0]) / sample_rate
             # adjust fs
             adjust_fs = torchaudio.transforms.Resample(sample_rate, fs)
             signal = adjust_fs(signal)
-            torchaudio.save('./sound.wav', signal, fs, format="wav")
-            pre_file_dir = '/sound.wav'
+            new_name = str(time.time()).split(".")[-1]
+            torchaudio.save(f'{self.path}/{new_name}.wav', signal, fs, format="wav")
+            file_dir = f'{self.path}/{new_name}.wav'
         else:
             torchaudio.set_audio_backend("sox_io")
             fs = 16000
@@ -87,110 +166,98 @@ class SpeechProcessingUnit():
             # adjust fs
             adjust_fs = torchaudio.transforms.Resample(sample_rate, fs)
             signal = adjust_fs(signal)
-            torchaudio.save('./sound.wav', signal, fs, format="wav")
-            pre_file_dir = './sound.wav'
+            new_name = str(time.time()).split(".")[-1]
+            torchaudio.save(f'{self.path}/{new_name}.wav', signal, fs, format="wav")
+            file_dir = f'{self.path}/{new_name}.wav'
 
-        return pre_file_dir
+        return file_dir, file_duration
 
+    def vad_task(self, cfg):
+        out_manifest_filepath = vad(cfg)
+        return out_manifest_filepath
 
-    def segmentaion(self, file_dir):
+    def diarization_task(self, testdata_dir):
+        meta = {
+            'audio_filepath': testdata_dir,
+            'offset': 0,
+            'duration': None,
+            'label': 'infer',
+            'text': '-',
+            'num_speakers': self.num_speakers,
+            'rttm_filepath': None,
+            'uem_filepath': None
+        }
+        with open(f'{self.path}/configs/input_manifest.json', 'w') as fp:
+            json.dump(meta, fp)
+            fp.write('\n')
 
-        sad = Pretrained(
-            validate_dir=f'{self.path}/finetuned_models/models/sad/train/AMI.SpeakerDiarization.MixHeadset.train/weights')
-        print("load success")
-        test_file = {'uri': '023_30_M', 'audio': file_dir}
-        sad_scores = sad(test_file)
-        print(sad_scores)
-        sad_args = self.args["speech_turn_segmentation"]["speech_activity_detection"]
-        binarize = Binarize(offset=sad_args["offset"], onset=sad_args["onset"], log_scale=True,
-                            min_duration_off=sad_args["min_duration_off"], min_duration_on=sad_args["min_duration_on"])
+        model_config = f'{self.path}/configs/diar_infer_telephonic.yaml'
+        config_dia = OmegaConf.load(model_config)
 
-        speech = binarize.apply(sad_scores, dimension=1)
-
-        print(speech)
-        print(speech.segments_list_)
-
-        speech_segments = []
-        temp_segment = {}
-        for i in speech.segments_list_:
-            temp_segment["begin"] = i.start
-            temp_segment["end"] = i.end
-            speech_segments.append(copy.deepcopy(temp_segment))
-
-        return speech_segments
-
-
-    def speaker_diarization(self, path_to_file, speech_segments, gpu_number):
-        """
-        
-        :param path_to_file: path of audio file
-        :param speech_segments: segmens of speech from vad output ex: [{"begin": 0.233, "end": 2.085}, {"begin": 2.869, "end": 4.379}]
-        :return: a list of clusters ex: [{"speakers": [{"id": int, "prob": float}, ...], "begin": float, "end": float}, ...]
-        """
-        clusters = diarization(path_to_file, speech_segments, gpu_number)
-
-        return clusters
+        sd_model = ClusteringDiarizer(cfg=config_dia)
+        sd_model.diarize()
 
 
+if __name__ == "__main__":
+    file_path_index = -1
+    save_path_index = -1
+    vad_path_index = -1
+    threshold_index = -1
+    gpu_number_index = -1
+    num_speaker_index = -1
 
-    def export(self, sig, fs_sig, vad, fs_vad):
+    threshold = 0.5
+    save_path = ""
+    file_path = ""
+    vad_path = ""
+    gpu_number = 0
+    num_speakers = 5
 
-        channels = len(sig.shape)
-        if channels == 2:
-            # print('WARNING: stereo to mono')
-            sig = sig[:, 0]
+    for i, arg in enumerate(sys.argv):
+        if arg == "file_path":
+            file_path_index = i + 1
 
-        vad = np.asarray(vad)
-        scale = int(fs_sig / fs_vad)
-        vad = np.repeat(vad, scale)
-        vad = vad[:len(sig)]
+        elif arg == "save_path":
+            save_path_index = i + 1
 
-        idx = np.where(vad == 1)
-        speech = sig[idx[0]]
+        elif arg == "vad_path":
+            vad_path_index = i + 1
 
-        noise = np.delete(sig, idx)
+        elif arg == "threshold":
+            threshold_index = i + 1
 
-        return speech, noise
+        elif arg == 'gpu_number':
+            gpu_number_index = i + 1
 
+        elif arg == "num_speakers":
+            num_speaker_index = i + 1
 
+        elif vad_path_index == i:
+            vad_path = arg
 
+        elif file_path_index == i:
+            file_path = arg
 
+        elif save_path_index == i:
+            save_path = arg
 
-if __name__ == '__main__':
+        elif threshold_index == i:
+            threshold = arg
 
-    # fs , signal = wav.read("sample.wav")
-    # fs, signal = wav.read("t6_speech.wav")
-    # [signal, fs] = sf.read("sa1.wav")
-    cur_dir = os.path.dirname(os.path.realpath(__file__))
+        elif gpu_number_index == i:
+            gpu_number = int(arg)
 
-    fs = 16000
-    sound = AudioSegment.from_mp3(os.path.join(cur_dir, '00000.mp3'))
+        elif num_speaker_index == i:
+            num_speakers = int(arg)
 
-    # adjust fs
-    if sound.frame_rate != fs:
-        sound = sound.set_frame_rate(fs)
+    spu = SpeechProcessingUnit(file_path, num_speakers, gpu_number, threshold)
 
-    signal = np.frombuffer(sound._data, dtype=np.int16, offset=0)
+    task = "vad_diarization"
+    output_string = spu(task)
 
-    # saving signal
-    # sound.export('demo16', format='mp3')
-
-    # creating sound object from vector and adjusting fs
-    # sound = AudioSegment(signal.tobytes(), frame_rate=fs, sample_width=signal.dtype.itemsize, channels=1)
-    # sound = sound.set_frame_rate(16000)
-    # signal = np.frombuffer(sound._data, dtype=np.int16, offset=0)
-
-
-    spu = SpeechProcessingUnit()
-    vad_out = spu.vad(signal, fs)
-    print(vad_out)
-
-    # speech_segments = [{"begin": 0.233, "end": 2.085}, {"begin": 2.869, "end": 4.379}, {"begin": 4.5, "end": 4.7}]
-    spu.speaker_diarization(signal, fs, speech_segments)
-
-
-    # plt.figure()
-    # plt.plot(signal)
-    # plt.figure()
-    # plt.plot(vad_out["vad_out"])
-    # plt.show()
+    print("===start===")
+    with open(output_string) as f:
+        dict_out = json.load(f)
+        print(dict_out)
+    print("====end====")
+    os.remove(output_string)
