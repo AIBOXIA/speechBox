@@ -1,201 +1,172 @@
+import fileinput
+import codecs, json
 import sys
+from pydub import AudioSegment
+import numpy as np
 import yaml
 import os
-import torchaudio
-from pydub import AudioSegment
-from typing import List, Dict, Union
-from vad_test import vad
-import json
-from omegaconf import OmegaConf
-from nemo.collections.asr.models import ClusteringDiarizer
-import time
+from pyannote.audio.pipelines.segmentation import SpeakerSegmentation as Pipeline_seg
+from pyannote.audio import Pipeline
 
+path = os.path.dirname(os.path.realpath(__file__))
 
 class SpeechProcessingUnit:
-    def __init__(self, testdata_dir, num_speakers=5, gpu_number=1, threshold=0.5):
-        path = os.path.dirname(os.path.realpath(__file__))
-        self.path = path
-        self.num_speakers = num_speakers
-        self.testdata_dir = testdata_dir
-        file_name_prepare, file_duration = self.prepare(testdata_dir)
-        self.file_name = file_name_prepare
+    def __init__(self, num_gpu, prob_threshold):
         # initialize segmentation pipeline
-        config_vad, config_dia = self.initialize_config(file_name_prepare, gpu_number, threshold)
-        self.cfg = config_vad
-        self.config_dia = config_dia
+        self.args, self.path = self.initialize_config()
+        self.pipeline_seg = Pipeline_seg(segmentation=f"{path}/models/segmentation/epoch=330-step=27804.ckpt",
+                                         my_needs=num_gpu)
+        self.initial_params = {"onset": float(prob_threshold)+0.1,
+                               "offset": float(prob_threshold)-0.1,
+                               "stitch_threshold": self.args['params']['stitch_threshold'],
+                               "min_duration_on": self.args['params']['min_duration_on'],
+                               "min_duration_off": self.args['params']['min_duration_off']
+                               }
+        self.pipeline_seg.instantiate(self.initial_params)
 
-    def initialize_config(self, testdata_dir, gpu_number, threshold):
+        # initialize diarization pipeline
+        self.pipeline_dia = Pipeline.from_pretrained(f"{path}/models/pipeline/config.yml", num_gpu)
 
-        with open(f"{self.path}/configs/vad_inference_postprocessing.yaml") as file:
-            config_vad = yaml.load(file, Loader=yaml.FullLoader)
+    def initialize_config(self):
 
-        audio_name = testdata_dir.split('/')[-1]
-        config_vad["out_manifest_filepath"] = audio_name.split('.')[0] + '.json'
-        config_vad["vad"]["model_path"] = f'{self.path}/models/epoch=200-step=5025.ckpt'
-        config_vad["dataset"] = f'{self.path}/configs/vad_test.json'
-        config_vad["vad"]["parameters"]["postprocessing"]["onset"] = float(threshold) + 0.1
-        config_vad["vad"]["parameters"]["postprocessing"]["offset"] = float(threshold) - 0.1
+        # path = "/app/bin/external_apps/ai_unit"
 
-        with open(f'{self.path}/configs/vad_inference_postprocessing.yaml', 'w') as s:
-            yaml.dump(config_vad, s)
+        self.path = path
+        with open(f'{path}/config.yml') as f:
+            args = yaml.load(f, Loader=yaml.FullLoader)
 
-        with open(config_vad["dataset"]) as json_file:
-            data_dir = json.load(json_file)
+        with open(f'{path}/models/pipeline/config.yml') as s:
+            pipe = yaml.load(s, Loader=yaml.FullLoader)
 
-        data_dir['audio_filepath'] = testdata_dir
+        pipe['pipeline']['params']['embedding'] = f'{path}/models/pipeline/speechbrain'
+        pipe['pipeline']['params']['segmentation'] = f'{path}/models/segmentation/epoch=330-step=27804.ckpt'
 
-        with open(config_vad["dataset"], 'w') as json_file:
-            json.dump(data_dir, json_file)
+        with open(f'{path}/models/pipeline/config.yml', "w") as s:
+            yaml.dump(pipe, s)
 
-        with open(f"{self.path}/configs/diar_infer_telephonic.yaml") as file:
-            config_dia = yaml.load(file, Loader=yaml.FullLoader)
+        for i, line in enumerate(fileinput.input(f'{path}/models/pipeline/speechbrain/hyperparams.yaml', inplace=1)):
+            if line[0:15] == "pretrained_path":
+                sys.stdout.write(line.replace(line, f'pretrained_path: "{path}/models/pipeline/speechbrain"\n'))
+            else:
+                sys.stdout.write(line.replace(line, line))
 
-        config_dia["diarizer"]["speaker_embeddings"]["model_path"] = f'{self.path}/models/titanet-l.nemo'
-        config_dia["diarizer"]["manifest_filepath"] = f'{self.path}/configs/input_manifest.json'
-        self.out_dir = f'{self.path}/speaker_diar_output'
-        config_dia["diarizer"]["out_dir"] = self.out_dir
-        config_dia["diarizer"]["vad"]["external_vad_manifest"] = f'{self.file_name.split(".")[0]}.json'
-        config_dia["diarizer"]["vad"]["model_path"] = None
-        config_dia["device"] = f"cuda:{gpu_number}"
-        config_dia["diarizer"]["vad"]["parameters"]["onset"] = float(threshold) + 0.1
-        config_dia["diarizer"]["vad"]["parameters"]["offset"] = float(threshold) - 0.1
+        return args, path
 
-        with open(f'{self.path}/configs/diar_infer_telephonic.yaml', 'w') as s:
-            yaml.dump(config_dia, s)
+    def __call__(self, file: str, task: str) -> list:
+        if task == "segmentation":
+            segmentation, seg_annotation = self.segmentation_task(file)
 
-        return config_vad, config_dia
-
-    def __call__(self, task: str) -> Union[Dict, List, None, str]:
-
-        if task == "vad":
-            out_manifest_filepath = self.vad_task(self.cfg)
-            self.out_manifest_filepath = out_manifest_filepath
-            vad_out = []
-            with open(f"{self.path}/{self.file_name}.json") as file:
-                lines = file.readlines()
-                for line in lines:
-                    line = line.split(" ")
-                    start = float(line[3][:len(line[3]) - 1])
-                    end = start + float(line[5][:len(line[5]) - 1])
-                    dia_dict = {"begin": start, "end": end}
-                    vad_out.append(dia_dict)
-
-            with open(f"{self.path}/{self.file_name}_vad_dict.json", 'w') as fp:
-                json.dump(vad_out, fp, indent=4)
-                fp.write('\n')
-
-            return out_manifest_filepath
+            return seg_annotation
         elif task == "diarization":
-            self.diarization_task(self.file_name)
-            return dia_output
-
-        elif task == "vad_diarization":
-            self.vad_task(self.cfg)
-            self.diarization_task(self.file_name)
-            vad_out = []
-            with open(f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.json") as f:
-                lines = f.readlines()
-                for line in lines:
-                    line = line.split(" ")
-                    start = float(line[3][:len(line[3]) - 1])
-                    end = start + float(line[5][:len(line[5]) - 1])
-                    dia_dict = {"begin": start, "end": end}
-                    vad_out.append(dia_dict)
-
-            dia_out = []
-            num_speakers = self.num_speakers
-            with open(f"{self.out_dir}/pred_rttms/{self.file_name.split('/')[-1].split('.')[0]}.rttm") as f:
-                lines = f.readlines()
-                for line in lines:
-                    line = line.split(" ")
-                    start = float(line[5])
-                    end = start + float(line[8])
-                    speaker = int(line[11][8:])
-                    speakers = []
-                    for i in range(num_speakers):
-                        if i == speaker:
-                            temp = {"id": i, "prob": 100}
-                        else:
-                            temp = {"id": i, "prob": 0}
-                        speakers.append(temp)
-                    new_list = sorted(speakers, key=lambda d: d['prob'], reverse=True)
-                    dia_dict = {"begin": start, "end": end, "speakers": new_list}
-                    dia_out.append(dia_dict)
-
-            output = {
-                "sad_annotation": vad_out,
-                "dia_annotation": dia_out
-            }
-            output_dict_json = f"{self.path}/{self.testdata_dir.split('/')[-1].split('.')[0]}_out_dict.json"
-            with open(output_dict_json, 'w') as fp:
-                json.dump(output, fp, indent=4)
-                fp.write('\n')
-            del_file_json = f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.json"
-            del_file_wav = f"{self.path}/{self.file_name.split('/')[-1].split('.')[0]}.wav"
-
-            os.remove(f'{del_file_json}')
-            os.remove(f'{del_file_wav}')
-
-            os.remove(f'{self.path}/manifest_vad_input.json')
-
+            diarization = self.diarization_task(file)
+            print(type(diarization))
+            return diarization
+        elif task == "segmentation & diarization":
+            segmentation, seg_annotation = self.segmentation_task(file)
+            diarization = self.diarization_task(file, segmentation)
+            print(type(diarization))
+            return [seg_annotation, diarization]
         else:
-            sys.exit("your task should be one of vad, diarization, vad_diarization")
-        return output_dict_json
+            sys.exit("your task should be one of segmentation, diarization, segmentation & diarization")
 
-    def prepare(self, file_dir):
-        if (file_dir.split(".")[-1]) == "mp3":
-            sound = AudioSegment.from_mp3(file_dir)
-            sound = sound.set_channels(1)
-            sound.export(file_dir, format="mp3")
-            torchaudio.set_audio_backend("sox_io")
-            fs = 16000
-            signal, sample_rate = torchaudio.load(file_dir, format="mp3")
 
-            file_duration = len(signal[0]) / sample_rate
-            # adjust fs
-            adjust_fs = torchaudio.transforms.Resample(sample_rate, fs)
-            signal = adjust_fs(signal)
-            new_name = str(time.time()).split(".")[-1]
-            torchaudio.save(f'{self.path}/{new_name}.wav', signal, fs, format="wav")
-            file_dir = f'{self.path}/{new_name}.wav'
+    def segmentation_task(self, file):
+        output_seg = self.pipeline_seg(file, model_us=None)
+        segments = output_seg[0]._tracks
+        seg_annotation = []
+        for seg in segments:
+            seg_dict = {"begin": 0, "end": 0}
+            seg_dict.update({"begin": round(seg.start, 2), "end": round(seg.end, 2)})
+            seg_annotation.append(seg_dict)
+        return output_seg, seg_annotation
+
+    def diarization_task(self, file, segmentation_result=None):
+        segmentation = None
+        if segmentation_result is None:
+            segmentation, seg_annotation = self.segmentation_task(file)
         else:
-            torchaudio.set_audio_backend("sox_io")
-            fs = 16000
-            signal, sample_rate = torchaudio.load(file_dir, format="wav")
-            file_duration = len(signal[0]) / sample_rate
-            # adjust fs
-            adjust_fs = torchaudio.transforms.Resample(sample_rate, fs)
-            signal = adjust_fs(signal)
-            new_name = str(time.time()).split(".")[-1]
-            torchaudio.save(f'{self.path}/{new_name}.wav', signal, fs, format="wav")
-            file_dir = f'{self.path}/{new_name}.wav'
+            segmentation = segmentation_result
 
-        return file_dir, file_duration
+        segmentation_for_dia = segmentation[2]
+        output_dia = self.pipeline_dia(file, model_us=segmentation_for_dia)
+        embeddings = output_dia[1]
+        output_dia = output_dia[0]
+        diarization = output_dia._tracks
+        dia_annotation = []
+        for dia in diarization.items():
+            dia_dict = {"begin": 0, "end": 0, "speakers": " "}
+            for i in dia[1].values():
+                id_speakers = i
+                dia_dict.update(
+                    {"begin": round(dia[0].start, 2), "end": round(dia[0].end, 2), "speakers": f'{id_speakers}'})
+                dia_annotation.append(dia_dict)
 
-    def vad_task(self, cfg):
-        out_manifest_filepath = vad(cfg)
-        return out_manifest_filepath
+        output_annotation = {"dia_annotation": 0}
+        output_annotation.update({"dia_annotation": dia_annotation})
 
-    def diarization_task(self, testdata_dir):
-        meta = {
-            'audio_filepath': testdata_dir,
-            'offset': 0,
-            'duration': None,
-            'label': 'infer',
-            'text': '-',
-            'num_speakers': self.num_speakers,
-            'rttm_filepath': None,
-            'uem_filepath': None
-        }
-        with open(f'{self.path}/configs/input_manifest.json', 'w') as fp:
-            json.dump(meta, fp)
-            fp.write('\n')
+        segments_probs = self.diarization_probabilities(diarization, embeddings, dia_annotation)
 
-        model_config = f'{self.path}/configs/diar_infer_telephonic.yaml'
-        config_dia = OmegaConf.load(model_config)
+        for index, prob in enumerate(segments_probs):
+            prob_list = []
+            for lenght in range(len(prob)):
+                prob_list.append({"id": lenght, "prob": round(prob[lenght] * 100, 2)})
 
-        sd_model = ClusteringDiarizer(cfg=config_dia)
-        sd_model.diarize()
+            newlist = sorted(prob_list, key=lambda d: d['prob'], reverse=True)
+            output_annotation['dia_annotation'][index]['speakers'] = newlist
+
+        return [output_annotation, segments_probs]
+
+
+    @staticmethod
+    def diarization_probabilities(diarization: dict, embeddings: dict, dia_annotation: list) -> list:
+        segments_embedding = []
+        for dia in diarization:
+            embed_sum = [0] * 192
+            for embed in range(int(dia.start // 0.2), int(dia.end // 0.2) + 1):
+                for code_embed in range(len(embeddings[embed][0])):
+                    if not np.isnan(embeddings[embed][0][code_embed]):
+                        embed_sum[code_embed] += embeddings[embed][0][code_embed]
+                    if not np.isnan(embeddings[embed][1][code_embed]):
+                        embed_sum[code_embed] += embeddings[embed][1][code_embed]
+            embed_sum = np.array(embed_sum)
+            embed_count = dia.end // 0.2 + 1 - dia.start // 0.2 + 1
+            embed_end = embed_sum / int(embed_count)
+            segments_embedding.append(embed_end)
+        number_speakers = 0
+
+        for dia_annot in range(len(dia_annotation)):
+            speaker_number = int(dia_annotation[dia_annot]["speakers"][8:])
+            if number_speakers < speaker_number:
+                number_speakers = speaker_number
+        number_speakers += 1
+        cluster_centers = np.array([[0.0] * 192] * number_speakers)
+        cluster_centers_assign = np.array([0] * number_speakers)
+
+        for dia_annot in range(len(dia_annotation)):
+            if float(dia_annotation[dia_annot]["end"] - dia_annotation[dia_annot]["begin"]) > 1:
+                speaker_number = int(dia_annotation[dia_annot]["speakers"][8:])
+                cluster_centers[speaker_number] += segments_embedding[dia_annot]
+                cluster_centers_assign[speaker_number] += 1
+
+        for n_speaker in range(number_speakers):
+            cluster_centers[n_speaker] = cluster_centers[n_speaker] / cluster_centers_assign[n_speaker]
+        segments_probs = []
+
+        for seg_index in range(len(segments_embedding)):
+            distance_from_center = []
+            sum_all = 0
+            for cluster_index in range(len(cluster_centers)):
+                sum_sq = np.sqrt(np.sum(np.square(segments_embedding[seg_index] - cluster_centers[cluster_index])))
+                distance_from_center.append(sum_sq)
+                sum_all += sum_sq
+            sum_temp = 0
+            for distance in range(len(distance_from_center)):
+                distance_from_center[distance] = sum_all / distance_from_center[distance]
+                sum_temp += distance_from_center[distance]
+            distance_from_center = np.array(distance_from_center)
+            distance_from_center = distance_from_center / sum_temp
+            segments_probs.append(distance_from_center)
+        return segments_probs
 
 
 if __name__ == "__main__":
@@ -204,14 +175,14 @@ if __name__ == "__main__":
     vad_path_index = -1
     threshold_index = -1
     gpu_number_index = -1
-    num_speaker_index = -1
+    task_index = -1
 
     threshold = 0.5
     save_path = ""
     file_path = ""
     vad_path = ""
     gpu_number = 0
-    num_speakers = 5
+    task = ""
 
     for i, arg in enumerate(sys.argv):
         if arg == "file_path":
@@ -229,8 +200,8 @@ if __name__ == "__main__":
         elif arg == 'gpu_number':
             gpu_number_index = i + 1
 
-        elif arg == "num_speakers":
-            num_speaker_index = i + 1
+        elif arg == "task":
+            task_index = i+1
 
         elif vad_path_index == i:
             vad_path = arg
@@ -247,17 +218,20 @@ if __name__ == "__main__":
         elif gpu_number_index == i:
             gpu_number = int(arg)
 
-        elif num_speaker_index == i:
-            num_speakers = int(arg)
+        elif task_index == i:
+            task = arg
 
-    spu = SpeechProcessingUnit(file_path, num_speakers, gpu_number, threshold)
 
-    task = "vad_diarization"
-    output_string = spu(task)
-
-    print("===start===")
-    with open(output_string) as f:
-        dict_out = json.load(f)
-        print(dict_out)
-    print("====end====")
-    os.remove(output_string)
+    speech = SpeechProcessingUnit(gpu_number, threshold)
+    testdata_dir = file_path
+    if (testdata_dir.split(".")[-1]) == "mp3":
+        sound = AudioSegment.from_mp3(testdata_dir)
+        sound.export(f"{speech.path}/sound.wav", format="wav")
+        testdata_dir = f'{speech.path}/sound.wav'
+        print("===start===")
+        print(json.dumps(speech(testdata_dir, task)))
+        print("====end====")
+    else:
+        print("===start===")
+        print(json.dumps(speech(testdata_dir, task)))
+        print("====end====")
