@@ -11,13 +11,6 @@ an4_audio = '/home/chita/workstation/NeMo/noise3.wav'
 sr = 16000
 signal, sr = librosa.load(an4_audio, sr=sr)
 
-# labels = rttm_to_labels(an4_rttm)
-# reference = labels_to_pyannote_object(labels)
-# print(labels)
-
-# Create a manifest for input with below format.
-# {'audio_filepath': /path/to/audio_file, 'offset': 0, 'duration':None, 'label': 'infer', 'text': '-',
-# 'num_speakers': None, 'rttm_filepath': /path/to/rttm/file, 'uem_filepath'='/path/to/uem/filepath'}
 
 meta = {
     'audio_filepath': an4_audio,
